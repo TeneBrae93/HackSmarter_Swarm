@@ -1,37 +1,17 @@
-"""
-tools.py — LangChain tools for HackSmarter Swarm.
-
-Key fixes applied
------------------
-1. _clean_env()          – strips ALL secrets from every subprocess environment.
-2. _assert_in_scope()    – hard scope enforcement before any network call.
-3. Nuclei parsing        – always JSONL (one object per line), never json.load().
-4. Feroxbuster filter    – only HTTP 200/204 treated as "interesting files".
-5. WPScan output         – written to a JSON file; no silent truncation.
-6. Logging               – Python logging throughout; no bare print().
-"""
-
-import json
-import logging
-import os
-import re
 import subprocess
-import threading
-from typing import List, Union
-
+import json
+import re
+import logging
+import threading # Added for tool concurrency control
+import sqlite3  # Added for relational database support
 from langchain_core.tools import tool
+import os
 from tqdm import tqdm
-import sqlite3
+from typing import Union, List
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-logger = logging.getLogger("hacksmarter.tools")
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Globals
-# ---------------------------------------------------------------------------
-DB_PATH = "recon.db"
+DB_PATH = "recon.db"  # Changed from pentest_db.json
 OUTPUT_DIR = "."
 SKIP_CURRENT_TASK = False
 FEROX_LOCK = threading.Lock()
@@ -99,9 +79,10 @@ def _clean_env() -> dict:
 # ---------------------------------------------------------------------------
 
 def init_db():
-    """Initialise SQLite schema."""
+    """Initializes the SQLite database with the required schema."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # Schema matching our previous JSON keys
     c.execute("CREATE TABLE IF NOT EXISTS subdomains (domain TEXT PRIMARY KEY)")
     c.execute(
         "CREATE TABLE IF NOT EXISTS open_ports "
@@ -128,31 +109,26 @@ def init_db():
     conn.commit()
     conn.close()
 
-
 def set_output_dir(path: str):
-    """Change the global output directory and reinitialise the database."""
+    """Sets the global output directory and updates DB_PATH."""
     global OUTPUT_DIR, DB_PATH
     OUTPUT_DIR = path
     DB_PATH = os.path.join(path, "recon.db")
-    init_db()
-
+    init_db()  # Initialize the DB file in the new folder
 
 def update_db(key: str, new_data: list):
-    """Upsert *new_data* under the given category key."""
+    """Updates the SQLite database with new findings based on the provided key."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    
     try:
         if key == "subdomains":
             for domain in new_data:
-                c.execute(
-                    "INSERT OR IGNORE INTO subdomains (domain) VALUES (?)", (domain,)
-                )
+                c.execute("INSERT OR IGNORE INTO subdomains (domain) VALUES (?)", (domain,))
         elif key == "open_ports":
-            for item in new_data:
-                c.execute(
-                    "INSERT OR IGNORE INTO open_ports (target, port) VALUES (?, ?)",
-                    (item.get("target"), item.get("port")),
-                )
+            for port_data in new_data:
+                c.execute("INSERT OR IGNORE INTO open_ports (target, port) VALUES (?, ?)", 
+                         (port_data.get("target"), port_data.get("port")))
         elif key == "vulnerabilities":
             for v in new_data:
                 c.execute(
@@ -184,283 +160,275 @@ def update_db(key: str, new_data: list):
                 )
         elif key == "interesting_files":
             for f in new_data:
-                c.execute(
-                    "INSERT OR IGNORE INTO interesting_files "
-                    "(target, url, status, comment) VALUES (?, ?, ?, ?)",
-                    (
-                        f.get("target"),
-                        f.get("url"),
-                        f.get("status"),
-                        f.get("comment", ""),
-                    ),
-                )
+                c.execute("INSERT OR IGNORE INTO interesting_files (target, url, comment) VALUES (?, ?, ?)",
+                         (f.get("target"), f.get("url"), f.get("comment", "")))
+        
         conn.commit()
-    except Exception as exc:
-        logger.error("SQLite update_db error (%s): %s", key, exc)
+    except Exception as e:
+        print(f"[!] SQLite update_db Error ({key}): {e}")
     finally:
         conn.close()
     return new_data
 
-
 def is_already_run(tool_name: str, target: str) -> bool:
+    """Checks if a tool has already been run against a target in the SQLite DB."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(
-        "SELECT 1 FROM tool_runs WHERE tool_name = ? AND target = ?",
-        (tool_name, target),
-    )
+    c.execute("SELECT 1 FROM tool_runs WHERE tool_name = ? AND target = ?", (tool_name, target))
     result = c.fetchone()
     conn.close()
     return result is not None
 
-
 def mark_as_run(tool_name: str, target: str):
+    """Marks a tool as having been run against a target in the SQLite DB."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
-        c.execute(
-            "INSERT OR IGNORE INTO tool_runs (tool_name, target) VALUES (?, ?)",
-            (tool_name, target),
-        )
+        c.execute("INSERT OR IGNORE INTO tool_runs (tool_name, target) VALUES (?, ?)", (tool_name, target))
         conn.commit()
-    except Exception as exc:
-        logger.error("SQLite mark_as_run error: %s", exc)
+    except Exception as e:
+        print(f"[!] SQLite mark_as_run Error: {e}")
     finally:
         conn.close()
 
-
-# ---------------------------------------------------------------------------
-# httpx helper (not a LangChain tool — called directly from vuln_node)
-# ---------------------------------------------------------------------------
-
 def filter_live_targets_httpx(targets: list) -> list:
-    """Probe *targets* with httpx and return only live URLs."""
-    logger.info("Probing %d potential targets with httpx…", len(targets))
+    """
+    Takes a list of raw URLs/Domains, pipes them into httpx, 
+    and returns only the ones that respond with a live web server.
+    """
+    print(f"[*] Probing {len(targets)} potential targets with httpx...")
     if not targets:
         return []
+        
     try:
-        result = subprocess.run(
-            ["httpx-toolkit", "-silent", "-nc"],
-            input="\n".join(targets),
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env=_clean_env(),
-        )
-        live = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        logger.info("httpx verified %d live targets.", len(live))
-        if not result.stdout.strip() and result.returncode != 0 and result.stderr:
-            logger.warning("httpx stderr: %s", result.stderr.strip())
-        return live
-    except subprocess.TimeoutExpired:
-        logger.warning("httpx timed out after 120 s.")
-        return []
+        input_data = "\n".join(targets)
+        
+        # Added a 2-minute timeout to prevent potential hangs
+        try:
+            result = subprocess.run(
+                ['httpx-toolkit', '-silent', '-nc'], # Switched back to toolkit alias
+                input=input_data,
+                capture_output=True, text=True,
+                timeout=120
+            )
+        except subprocess.TimeoutExpired:
+            print("[!] httpx probe timed out after 120 seconds. Moving on.")
+            return []
+            
+        output = result.stdout.strip()
+        print(f"[*] httpx probe finished. Verified {len(output.split('\n')) if output else 0} live targets.")
+        
+        # If output is totally empty, it means 0 live hosts
+        if not output:
+            if result.returncode != 0 and result.stderr:
+                print(f"[!] httpx error output: {result.stderr.strip()}")
+            return []
+            
+        # Parse the output into a clean list of verified URLs
+        live_urls = [line.strip() for line in output.split('\n') if line.strip()]
+        return live_urls
+        
     except FileNotFoundError:
-        logger.warning("httpx-toolkit not found — falling back to raw list.")
-        return targets
-    except Exception as exc:
-        logger.error("Unexpected httpx error: %s", exc)
-        return targets
-
-
-# ---------------------------------------------------------------------------
-# LangChain tools
-# ---------------------------------------------------------------------------
+        logger.warning("httpx binary not found. Skipping live-host filter — install httpx-toolkit and ensure it is in your PATH.")
+        return []
+    except Exception as e:
+        logger.error("Unexpected httpx error: %s. Skipping live-host filter to avoid scanning unverified targets.", e)
+        return []
 
 @tool
 def run_httpx_tool(targets: Union[str, List[str]]) -> List[str]:
     """
-    Probe one or more targets (URLs/domains) with httpx and return only live
-    web servers. Use this before running feroxbuster or wpscan.
-
-    Args:
-        targets: A single target string or a list of target strings.
+    Takes a single target or a list of targets (URLs/domains), 
+    probes them with httpx, and returns a list of only the live web servers.
+    Use this to verify if a target is alive before running dirsearch or wpscan.
     """
     target_list = [targets] if isinstance(targets, str) else targets
     return filter_live_targets_httpx(target_list)
 
-
 @tool
 def format_scope_tool(scope: str) -> dict:
     """
-    Categorise a user-provided scope string as IP or Domain.
-
-    Args:
-        scope: Raw input such as '192.168.1.1' or 'example.com'.
+    Analyzes the user-provided scope and categorizes it.
+    Args: scope (str): The raw input (e.g., '192.168.1.1', 'example.com', '10.0.0.0/24')
     """
-    is_ip = bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", scope))
+    # Basic regex for IP vs Domain (You can expand this for CIDR)
+    is_ip = re.match(r"^\d{1,3}(\.\d{1,3}){3}$", scope)
+    
     return {
         "original_scope": scope,
         "type": "IP" if is_ip else "Domain",
-        "ready_for_nmap": is_ip,
-        "ready_for_subfinder": not is_ip,
+        "ready_for_nmap": bool(is_ip),
+        "ready_for_subfinder": not bool(is_ip)
     }
-
 
 @tool
 def run_subfinder_tool(domain: str) -> str:
     """
-    Enumerate subdomains for a given domain using subfinder.
-
-    Args:
-        domain: Root domain to enumerate (e.g. 'example.com').
+    Finds subdomains for a given target domain using subfinder.
+    Returns a success message with the count of subdomains found. 
+    This list should be considered the exhaustive source of truth for subdomains.
     """
-    try:
-        _assert_in_scope(domain)
-    except ValueError as exc:
-        return f"[SCOPE BLOCK] {exc}"
-
     if is_already_run("subfinder", domain):
-        return f"[SKIP] subfinder already run for {domain}."
-
+        return f"[!] Skipping subfinder for {domain} - Results already in database."
+        
     global SKIP_CURRENT_TASK
-    logger.info("Running subfinder on %s…", domain)
+    print(f"[*] Recon Agent executing subfinder on {domain}...")
     try:
-        result = subprocess.run(
-            ["subfinder", "-d", domain, "-silent"],
-            capture_output=True,
-            text=True,
-            env=_clean_env(),
-        )
+        result = subprocess.run(['subfinder', '-d', domain, '-silent'], capture_output=True, text=True)
+        
         if SKIP_CURRENT_TASK:
             SKIP_CURRENT_TASK = False
             mark_as_run("subfinder", domain)
-            return f"Subfinder for {domain} skipped by user."
+            print(f"\n[!] Subfinder scan for {domain} skipped (User Interrupt).")
+            return f"Subfinder scan for {domain} was skipped by user."
+            
     except KeyboardInterrupt:
         SKIP_CURRENT_TASK = False
         mark_as_run("subfinder", domain)
-        return f"Subfinder for {domain} skipped by user."
-    except Exception as exc:
-        return f"Subfinder error: {exc}"
+        print(f"\n[!] Subfinder scan for {domain} interrupted by user. Skipping.")
+        return f"Subfinder scan for {domain} was skipped by user."
+    except subprocess.CalledProcessError as e:
+        return f"Subfinder command failed. Error: {e.stderr}"
+    except Exception as e:
+        return f"An unexpected error occurred: {str(e)}"
+    
+    output = result.stdout.strip()
+    
+    if not output:
+        mark_as_run("subfinder", domain)
+        return f"Subfinder scan completed for {domain}. Result: 0 subdomains discovered. This is a valid result."
 
-    subdomains = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-    mark_as_run("subfinder", domain)
-    if not subdomains:
-        return f"Subfinder completed for {domain}: 0 subdomains found."
+    # Parse plain text output (one subdomain per line)
+    subdomains = [line.strip() for line in output.split('\n') if line.strip()]
+            
     update_db("subdomains", subdomains)
-    return f"Subfinder found {len(subdomains)} subdomains: {', '.join(subdomains)}"
-
+    mark_as_run("subfinder", domain)
+    return f"Subfinder scan successful for {domain}. Found {len(subdomains)} subdomains: {', '.join(subdomains)}"
 
 @tool
-def run_nmap_tool(target: str) -> str:
+def run_nmap_tool(target: str) -> list:
     """
-    Fast nmap port scan against a target IP or domain.
-
-    Args:
-        target: IP address or hostname to scan.
+    Runs a fast nmap port scan against a target IP or domain.
+    Args: target (str): The IP or domain to scan.
     """
-    try:
-        _assert_in_scope(target)
-    except ValueError as exc:
-        return f"[SCOPE BLOCK] {exc}"
-
     if is_already_run("nmap", target):
-        return f"[SKIP] nmap already run for {target}."
+        return f"[!] Skipping nmap for {target} - Results already in database."
 
     global SKIP_CURRENT_TASK
-    logger.info("Running nmap on %s…", target)
     try:
-        result = subprocess.run(
-            ["nmap", "-F", "-T4", "--open", "-oG", "-", target],
-            capture_output=True,
-            text=True,
-            env=_clean_env(),
-        )
+        print(f"[*] Recon Agent executing nmap on {target}...")
+        result = subprocess.run(['nmap', '-F', '-T4', '--open', '-oG', '-', target], capture_output=True, text=True)
+        
         if SKIP_CURRENT_TASK:
             SKIP_CURRENT_TASK = False
             mark_as_run("nmap", target)
-            return f"Nmap for {target} skipped by user."
+            print(f"\n[!] Nmap scan for {target} skipped (User Interrupt).")
+            return f"Nmap scan for {target} was skipped by user."
+            
     except KeyboardInterrupt:
         SKIP_CURRENT_TASK = False
         mark_as_run("nmap", target)
-        return f"Nmap for {target} skipped by user."
-    except Exception as exc:
-        return f"Nmap error: {exc}"
+        print(f"\n[!] Nmap scan for {target} interrupted by user. Skipping.")
+        return f"Nmap scan for {target} was skipped by user."
+    except subprocess.CalledProcessError as e:
+        return [{"error": f"Nmap failed: {e.stderr}"}]
 
     open_ports = []
-    for line in result.stdout.splitlines():
+    for line in result.stdout.split('\n'):
         if "Ports:" in line:
-            for chunk in line.split("Ports: ")[1].split(", "):
-                if "/open/" in chunk:
-                    open_ports.append({"target": target, "port": chunk.split("/")[0].strip()})
-
+            # Extract the port numbers (Grepable output parsing)
+            ports_section = line.split("Ports: ")[1]
+            for port_data in ports_section.split(', '):
+                if "/open/" in port_data:
+                    port_num = port_data.split('/')[0].strip()
+                    open_ports.append({"target": target, "port": port_num})
+                        
     update_db("open_ports", open_ports)
     mark_as_run("nmap", target)
-    return (
-        f"Nmap on {target}: {len(open_ports)} open ports: "
-        f"{', '.join(p['port'] for p in open_ports)}"
-    )
-
+    ports_list = [p['port'] for p in open_ports]
+    return f"Nmap successful for {target}. Found {len(open_ports)} open ports: {', '.join(ports_list)}"
 
 @tool
 def run_nuclei_tool(targets: list, verbose: bool = False) -> str:
     """
-    Run Nuclei against a list of targets. Output is parsed as JSONL.
-
-    Args:
-        targets: List of target URLs.
-        verbose: Stream raw Nuclei output when True.
+    Runs Nuclei against a list of targets and safely parses the JSON output into the DB.
+    Args: 
+        targets (list): A list of target URLs to scan.
+        verbose (bool): If True, shows raw Nuclei output in the terminal.
     """
     global SKIP_CURRENT_TASK
-    out_file = os.path.join(OUTPUT_DIR, "nuclei_out.jsonl")
-
+    out_file = os.path.join(OUTPUT_DIR, 'nuclei_out.json')
+    
+    # 1. Clean up old output files to prevent cross-contamination
     if os.path.exists(out_file):
         os.remove(out_file)
 
     if not targets:
         return "No targets provided to Nuclei."
 
-    for t in targets:
-        try:
-            _assert_in_scope(t)
-        except ValueError as exc:
-            return f"[SCOPE BLOCK] {exc}"
-
-    logger.info("Running Nuclei on %d targets…", len(targets))
+    print(f"[*] Recon Agent executing Nuclei on {len(targets)} targets...")
     try:
+        # Run optimized nuclei command
+        input_data = "\n".join(targets)
+        
         cmd = [
-            "nuclei",
-            "-je", out_file,
-            "-severity", "low,medium,high,critical",
-            "-exclude-tags", "dos,fuzz",
-            "-rl", "5",
-            "-c", "5",
-            "-timeout", "10",
-            "-retries", "0",
-            "-mhe", "3",
-            "-stats", "-stats-json", "-stats-interval", "1",
+            'nuclei', 
+            '-je', out_file, 
+            '-severity', 'low,medium,high,critical',
+            '-exclude-tags', 'dos,fuzz',  
+            '-rl', '5',                   
+            '-c', '5',                    
+            '-timeout', '10',             
+            '-retries', '0',              
+            '-mhe', '3'      
         ]
+        
         if verbose:
             cmd.append("-v")
-
+            
+        # Add stats for the progress bar
+        cmd.extend(["-stats", "-stats-json", "-stats-interval", "1"])
+            
+        # Scrub GOOGLE_API_KEY
+        nuclei_env = os.environ.copy()
+        if "GOOGLE_API_KEY" in nuclei_env:
+            del nuclei_env["GOOGLE_API_KEY"]
+            
+        # Execute with real-time feedback
         process = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env=_clean_env(),
+            env=nuclei_env
         )
-        process.stdin.write("\n".join(targets))
-        process.stdin.close()
-
+        
+        # Write targets to stdin
+        if input_data:
+            process.stdin.write(input_data)
+            process.stdin.close()
+        
         pbar = None
         try:
-            for line in iter(process.stderr.readline, ""):
+            for line in iter(process.stderr.readline, ''):
                 if verbose:
-                    logger.debug("[nuclei] %s", line.rstrip())
+                    print(line.strip())
+                
                 try:
-                    if "{" in line:
-                        stats = json.loads(line[line.find("{"):line.rfind("}") + 1])
-                        total = int(stats.get("total", 0))
-                        current = int(stats.get("requests", 0))
-                        if pbar is None and total > 0:
-                            pbar = tqdm(total=total, desc="Nuclei", unit="req", leave=False)
+                    if "{" in line and "}" in line:
+                        stats = json.loads(line[line.find("{"):line.rfind("}")+1])
+                        total_reqs = int(stats.get("total", 0))
+                        curr_reqs = int(stats.get("requests", 0))
+                        
+                        if pbar is None and total_reqs > 0:
+                            pbar = tqdm(total=total_reqs, desc="[*] Nuclei Progress", unit="req", leave=False)
+                        
                         if pbar:
-                            pbar.n = current
+                            pbar.n = curr_reqs
                             pbar.refresh()
                 except (json.JSONDecodeError, ValueError):
-                    pass
+                    continue
         except KeyboardInterrupt:
             process.terminate()
             SKIP_CURRENT_TASK = False
@@ -468,370 +436,286 @@ def run_nuclei_tool(targets: list, verbose: bool = False) -> str:
                 mark_as_run("nuclei", t)
             if pbar:
                 pbar.close()
-            return "Nuclei skipped by user."
-
+            print("\n[!] Nuclei scan interrupted by user. Skipping to next phase.")
+            return "Nuclei scan was manually skipped. Moving to next verification phase."
+                
         process.wait()
         if pbar:
             pbar.close()
-
+            
         if SKIP_CURRENT_TASK:
             SKIP_CURRENT_TASK = False
             for t in targets:
                 mark_as_run("nuclei", t)
-            return "Nuclei skipped by user."
-
-        # FIX: parse JSONL correctly — one JSON object per line
+            print("\n[!] Nuclei scan skipped (User Interrupt).")
+            return "Nuclei scan was manually skipped."
+        
         findings = []
         if os.path.exists(out_file):
-            with open(out_file) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        item = json.loads(line)
-                        findings.append({
-                            "template": item.get("template-id"),
-                            "target": item.get("matched-at", "unknown"),
-                            "severity": item.get("info", {}).get("severity"),
-                            "description": item.get("info", {}).get("name"),
-                        })
-                    except json.JSONDecodeError as exc:
-                        logger.warning("Skipping malformed Nuclei line: %s", exc)
+            with open(out_file, 'r') as f:
+                try:
+                    parsed_data = json.load(f)
+                    items = parsed_data if isinstance(parsed_data, list) else [parsed_data]
+                except json.JSONDecodeError:
+                    f.seek(0)
+                    items = [json.loads(line) for line in f if line.strip()]
 
-        if findings:
-            update_db("vulnerabilities", findings)
-            return f"Nuclei complete — {len(findings)} findings added."
+                for item in items:
+                    findings.append({
+                        "template": item.get("template-id"),
+                        "target": item.get("matched-at", "unknown"), 
+                        "severity": item.get("info", {}).get("severity"),
+                        "description": item.get("info", {}).get("name")
+                    })
+            
+            if findings:
+                update_db("vulnerabilities", findings)
+                return f"Nuclei complete. Added {len(findings)} findings to DB."
+        
         return "Nuclei finished with 0 findings."
-
-    except Exception as exc:
-        logger.error("Nuclei error: %s", exc)
-        return f"Nuclei error: {exc}"
-
+        
+    except Exception as e:
+        print(f"[!] Critical Nuclei Parsing Error: {str(e)}")
+        return f"Nuclei tool error: {str(e)}"
 
 @tool
 def run_nc_banner_grab(target: str, port: int, send_string: str = "") -> str:
     """
-    Use netcat to grab a service banner or probe a port.
-
-    Args:
-        target: Hostname or IP.
-        port: Port number.
-        send_string: Optional string to send before reading.
+    Uses netcat (nc) to grab a service banner or send a custom string to a port.
+    Useful for manual verification of non-HTTP services.
     """
     try:
-        _assert_in_scope(target)
-    except ValueError as exc:
-        return f"[SCOPE BLOCK] {exc}"
-    try:
-        result = subprocess.run(
-            ["nc", "-vn", "-w", "2", str(target), str(port)],
-            input=send_string + "\n",
-            capture_output=True,
-            text=True,
-            env=_clean_env(),
-        )
-        return f"NC {target}:{port}:\n{result.stdout or result.stderr}"
-    except Exception as exc:
-        return f"NC Error: {exc}"
-
+        cmd = ["nc", "-vn", "-w", "2", str(target), str(port)]
+        input_data = send_string + "\n"
+        result = subprocess.run(cmd, input=input_data, capture_output=True, text=True)
+        
+        output = result.stdout if result.stdout else result.stderr
+        return f"NC Output for {target}:{port}:\n{output}"
+    except Exception as e:
+        return f"NC Error: {str(e)}"
 
 @tool
 def run_ssh_audit(target: str, port: int = 22) -> str:
     """
-    Run ssh-audit to identify weak ciphers, algorithms, and SSH CVEs.
-
-    Args:
-        target: Hostname or IP.
-        port: SSH port (default 22).
+    Runs ssh-audit to check for weak ciphers, algorithms, and vulnerabilities 
+    like Terrapin (CVE-2023-48795).
     """
     try:
-        _assert_in_scope(target)
-    except ValueError as exc:
-        return f"[SCOPE BLOCK] {exc}"
-    try:
         result = subprocess.run(
-            ["ssh-audit", "-p", str(port), target],
-            capture_output=True,
-            text=True,
-            env=_clean_env(),
+            ['ssh-audit', '-p', str(port), target],
+            capture_output=True, text=True
         )
-        return f"SSH Audit {target}:\n{result.stdout}"
-    except Exception as exc:
-        return f"SSH Audit Error: {exc}"
-
+        return f"SSH Audit Results for {target}:\n{result.stdout}"
+    except Exception as e:
+        return f"SSH Audit Error: {str(e)}"
 
 @tool
-def run_hydra_check(
-    target: str, service: str, user: str, password: str, port: int = None
-) -> str:
+def run_hydra_check(target: str, service: str, user: str, password: str, port: int = None) -> str:
     """
-    Verify a username/password pair against a service using Hydra.
-
-    Args:
-        target: Hostname or IP.
-        service: Protocol (ssh, ftp, http-get, etc.).
-        user: Username to test.
-        password: Password to test.
-        port: Optional port override.
+    Runs Hydra to verify if a specific username and password pair work on a service.
+    Supported services: ssh, ftp, http-get, mysql, mssql, etc.
     """
     try:
-        _assert_in_scope(target)
-    except ValueError as exc:
-        return f"[SCOPE BLOCK] {exc}"
-    try:
-        port_args = ["-s", str(port)] if port else []
-        result = subprocess.run(
-            ["hydra", "-l", user, "-p", password] + port_args + ["-f", f"{service}://{target}"],
-            capture_output=True,
-            text=True,
-            env=_clean_env(),
-        )
+        port_args = [f"-s", str(port)] if port else []
+        cmd = ["hydra", "-l", user, "-p", password] + port_args + ["-f", f"{service}://{target}"]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
         if "1 of 1 target successfully completed" in result.stdout:
-            return f"[SUCCESS] {user}:{password} works on {service}://{target}"
-        return f"[FAIL] {user}:{password} rejected on {service}://{target}"
-    except Exception as exc:
-        return f"Hydra Error: {exc}"
-
+            return f"[!] SUCCESS: Credentials verified! {user}:{password} works on {service}."
+        return f"[-] FAILURE: Credentials {user}:{password} were rejected."
+        
+    except Exception as e:
+        return f"Hydra Error: {str(e)}"
 
 @tool
 def run_testssl_verification(target: str) -> str:
     """
-    Deep SSL/TLS analysis with testssl.sh. Use when Nuclei flags an SSL issue.
-
-    Args:
-        target: Target URL or host:port.
+    Runs testssl.sh for a deep dive into SSL/TLS vulnerabilities.
+    Only use this if Nuclei flags a specific SSL issue.
     """
     try:
-        _assert_in_scope(target)
-    except ValueError as exc:
-        return f"[SCOPE BLOCK] {exc}"
-    try:
         result = subprocess.run(
-            ["testssl.sh", "--quiet", "--severity", "MEDIUM", target],
-            capture_output=True,
-            text=True,
-            env=_clean_env(),
+            ['testssl.sh', '--quiet', '--severity', 'MEDIUM', target],
+            capture_output=True, text=True
         )
-        return f"TestSSL {target}:\n{result.stdout}"
-    except Exception as exc:
-        return f"TestSSL Error: {exc}"
-
+        return f"TestSSL Results for {target}:\n{result.stdout}"
+    except Exception as e:
+        return f"TestSSL Error: {str(e)}"
 
 @tool
-def execute_curl_request(
-    url: str, method: str = "GET", headers: dict = None, data: str = None
-) -> str:
+def execute_curl_request(url: str, method: str = "GET", headers: dict = None, data: str = None) -> str:
     """
-    Execute a custom HTTP request with curl for manual vulnerability verification.
-
-    Args:
-        url: Target URL.
-        method: HTTP method (GET, POST, PUT, etc.).
-        headers: Optional dict of request headers.
-        data: Optional request body.
+    Executes a custom HTTP request using curl to verify vulnerabilities.
+    Args: 
+        url (str): The target URL.
+        method (str): HTTP method (GET, POST, etc.)
+        headers (dict): Optional headers.
+        data (str): Optional payload body.
     """
-    try:
-        _assert_in_scope(url)
-    except ValueError as exc:
-        return f"[SCOPE BLOCK] {exc}"
-    cmd = ["curl", "-s", "-i", "-X", method, url]
+    cmd = ['curl', '-s', '-i', '-X', method, url]
     if headers:
         for k, v in headers.items():
-            cmd.extend(["-H", f"{k}: {v}"])
+            cmd.extend(['-H', f"{k}: {v}"])
     if data:
-        cmd.extend(["-d", data])
+        cmd.extend(['-d', data])
+        
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=10, env=_clean_env()
-        )
-        return result.stdout[:2000]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return result.stdout[:2000] 
     except subprocess.TimeoutExpired:
-        return "Error: curl timed out."
-    except Exception as exc:
-        return f"Curl Error: {exc}"
-
+        return "Error: Curl request timed out."
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 @tool
 def run_wpscan_tool(target_url: str) -> str:
     """
-    Run WPScan against a target to detect WordPress, plugins, and CVEs.
-    Output is written to a JSON file rather than truncated in memory.
-
-    Args:
-        target_url: Full URL to scan (e.g. 'http://example.com').
+    Runs WPScan against a target URL to check for WordPress installations, 
+    vulnerabilities, and outdated plugins.
+    Args: target_url (str): The URL to scan (e.g., http://example.com)
     """
-    try:
-        _assert_in_scope(target_url)
-    except ValueError as exc:
-        return f"[SCOPE BLOCK] {exc}"
-
     if is_already_run("wpscan", target_url):
-        return f"[SKIP] wpscan already run for {target_url}."
+        return f"[!] Skipping wpscan for {target_url} - Results already in database."
 
-    out_file = os.path.join(OUTPUT_DIR, "wpscan_out.json")
-    wpscan_token = os.environ.get("WPSCAN_API_TOKEN")
-    token_args = ["--api-token", wpscan_token] if wpscan_token else []
-
-    cmd = (
-        ["wpscan", "--url", target_url, "--no-update",
-         "--random-user-agent", "-e", "vp,vt",
-         "--format", "json", "-o", out_file]
-        + token_args
-    )
-
-    logger.info("Running wpscan on %s…", target_url)
+    print(f"[*] Recon Agent executing wpscan on {target_url}...")
     try:
+        wpscan_token = os.environ.get("WPSCAN_API_TOKEN")
+        token_args = ["--api-token", wpscan_token] if wpscan_token else []
+
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, env=_clean_env())
+            result = subprocess.run(
+                ['wpscan', '--url', target_url, '--no-update', '--random-user-agent', '-e', 'vp,vt'] + token_args,
+                capture_output=True, text=True
+            )
         except KeyboardInterrupt:
+            print("\n[!] WPScan interrupted by user. Skipping.")
             mark_as_run("wpscan", target_url)
             return "WPScan interrupted by user."
-
-        # Retry after DB update if needed
+        
         if "missing database" in (result.stdout + result.stderr).lower():
-            logger.warning("WPScan DB missing — updating…")
-            subprocess.run(["wpscan", "--update"], capture_output=True, text=True)
+            print("[!] WPScan database missing. Attempting update...")
+            subprocess.run(['wpscan', '--update'], capture_output=True, text=True)
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, env=_clean_env())
+                result = subprocess.run(
+                    ['wpscan', '--url', target_url, '--no-update', '--random-user-agent', '-e', 'vp,vt'],
+                    capture_output=True, text=True
+                )
             except KeyboardInterrupt:
                 mark_as_run("wpscan", target_url)
                 return "WPScan interrupted by user."
-
+        
+        output = result.stdout if result.stdout else result.stderr
         mark_as_run("wpscan", target_url)
-
-        if os.path.exists(out_file):
-            with open(out_file) as fh:
-                raw = fh.read()
-            try:
-                parsed = json.loads(raw)
-                summary = {
-                    "interesting_findings": parsed.get("interesting_findings", []),
-                    "plugins": parsed.get("plugins", {}),
-                    "version": parsed.get("version", {}),
-                    "vulnerabilities": parsed.get("vulnerabilities", []),
-                }
-                return f"WPScan {target_url}:\n{json.dumps(summary, indent=2)}"
-            except json.JSONDecodeError:
-                pass
-
-        fallback = result.stdout or result.stderr
-        return f"WPScan {target_url}:\n{fallback}"
-
+        return f"WPScan Results for {target_url}:\n{output[:3000]}"
     except FileNotFoundError:
-        return "[!] wpscan binary not found."
-    except Exception as exc:
-        return f"WPScan Error: {exc}"
-
+        return "[!] WPScan binary not found! Make sure it is installed and in your PATH."
+    except Exception as e:
+        return f"WPScan Error: {str(e)}"
 
 @tool
-def add_vulnerability_tool(
-    target: str, template: str, severity: str, description: str, poc: str
-) -> str:
+def add_vulnerability_tool(target: str, template: str, severity: str, description: str, poc: str) -> str:
     """
-    Manually add a verified vulnerability to the database.
-
+    Manually adds a verified vulnerability to the database.
     Args:
-        target: Target URL or host.
-        template: Vulnerability name/ID (e.g. 'git-config-disclosure').
-        severity: low | medium | high | critical.
-        description: Brief description of the finding.
-        poc: Exact commands/steps needed to reproduce.
+        target (str): The target URL or host.
+        template (str): A name or ID for the vulnerability (e.g., 'git-config-disclosure').
+        severity (str): low, medium, high, or critical.
+        description (str): A brief description of the finding.
+        poc (str): A proof of concept (the command/output used to verify).
     """
-    update_db("vulnerabilities", [{
+    finding = {
         "template": template,
         "target": target,
         "severity": severity,
         "description": description,
-        "poc": poc,
-    }])
-    return f"Vulnerability '{template}' for {target} added to the database."
-
+        "poc": poc 
+    }
+    update_db("vulnerabilities", [finding])
+    return f"Successfully added vulnerability '{template}' for {target} to the database."
 
 @tool
-def run_feroxbuster_tool(
-    url: Union[str, List[str]],
-    extensions: str = "php,html,js,txt",
-    verbose: bool = False,
-) -> str:
+def run_feroxbuster_tool(url: Union[str, List[str]], extensions: str = "php,html,js,txt", verbose: bool = False) -> str:
     """
-    Directory and file discovery using feroxbuster.
-    Only HTTP 200/204 responses are recorded as findings (not 301/302/403).
-
+    Performs directory and file discovery on a web server using feroxbuster.
     Args:
-        url: Target URL or list of target URLs.
-        extensions: Comma-separated file extensions to probe.
-        verbose: Stream feroxbuster output when True.
+        url (Union[str, List[str]]): The target URL or a list of target URLs.
+        extensions (str): Comma-separated list of extensions to check (default: php,html,js,txt).
+        verbose (bool): If True, shows raw feroxbuster output in the terminal.
     """
-    # FIX: Only these statuses are genuinely "interesting files"
-    INTERESTING_STATUSES = {200, 204}
-
     with FEROX_LOCK:
         global SKIP_CURRENT_TASK
         targets = [url] if isinstance(url, str) else url
-
-        for t in targets:
-            try:
-                _assert_in_scope(t)
-            except ValueError as exc:
-                return f"[SCOPE BLOCK] {exc}"
-
+        
+        # Filter targets that were already run
         new_targets = [t for t in targets if not is_already_run("feroxbuster", t)]
+        
         if not new_targets:
-            return f"All {len(targets)} targets already scanned by feroxbuster."
+            return f"All {len(targets)} targets have already been scanned by feroxbuster."
 
-        out_file = os.path.join(OUTPUT_DIR, "feroxbuster_out.json")
+        print(f"[*] Sequential Scan: Executing feroxbuster on {len(new_targets)} targets one by one...")
         all_findings = []
-
+        
         for i, target in enumerate(new_targets):
-            if os.path.exists(out_file):
-                os.remove(out_file)
-
-            logger.info("[%d/%d] Feroxbuster scanning %s…", i + 1, len(new_targets), target)
-            cmd = [
-                "feroxbuster", "-u", target,
-                "-t", "10", "-d", "2",
-                "--json", "-o", out_file,
-                "-x", extensions,
-                "--no-state",
-            ]
-            if not verbose:
-                cmd.append("--silent")
-
+            out_file = os.path.join(OUTPUT_DIR, f'feroxbuster_out_{i}.json')
+                
             try:
-                subprocess.run(
-                    cmd, capture_output=not verbose, text=True,
-                    check=False, env=_clean_env(),
-                )
-            except KeyboardInterrupt:
-                SKIP_CURRENT_TASK = False
+                # Feroxbuster command for a single target
+                cmd = [
+                    'feroxbuster',
+                    '-u', target,
+                    '-t', '10', 
+                    '-d', '2',
+                    '--json',
+                    '-o', out_file,
+                    '-x', extensions,
+                    '--no-state' 
+                ]
+                
+                print(f"[*] [{i+1}/{len(new_targets)}] Deep Discovery: Exploring {target}")
+                print(f"    - Feroxbuster is performing exhaustive directory brute-forcing.")
+                print(f"    - This can take several minutes per target. Please stand by...")
+                
+                if not verbose:
+                    cmd.append('--silent')
+                    
+                # Run feroxbuster
+                try:
+                    subprocess.run(cmd, capture_output=not verbose, text=True, check=False)
+                except KeyboardInterrupt:
+                    SKIP_CURRENT_TASK = False
+                    mark_as_run("feroxbuster", target)
+                    print(f"\n[!] User skip requested for {target}. Moving to next target...")
+                    continue
+                
+                if SKIP_CURRENT_TASK:
+                    SKIP_CURRENT_TASK = False
+                    mark_as_run("feroxbuster", target)
+                    print(f"\n[!] User skip requested for {target}. Moving to next target...")
+                    continue
+                
+                # Parse output
+                if os.path.exists(out_file):
+                    with open(out_file, 'r') as f:
+                        for line in f:
+                            try:
+                                finding = json.loads(line)
+                                if finding.get("status") in [200, 204, 301, 302, 307, 403]:
+                                    all_findings.append({
+                                        "url": finding.get("url"),
+                                        "status": finding.get("status"),
+                                        "content_length": finding.get("content_length"),
+                                        "target": target
+                                    })
+                            except json.JSONDecodeError:
+                                continue
+                                
                 mark_as_run("feroxbuster", target)
+                
+            except Exception as e:
+                print(f"[!] Error scanning {target} with feroxbuster: {e}")
                 continue
-
-            if SKIP_CURRENT_TASK:
-                SKIP_CURRENT_TASK = False
-                mark_as_run("feroxbuster", target)
-                continue
-
-            if os.path.exists(out_file):
-                with open(out_file) as f:
-                    for line in f:
-                        try:
-                            finding = json.loads(line)
-                            status = finding.get("status")
-                            if status in INTERESTING_STATUSES:
-                                all_findings.append({
-                                    "url": finding.get("url"),
-                                    "status": status,
-                                    "content_length": finding.get("content_length"),
-                                    "target": target,
-                                    "comment": f"HTTP {status}",
-                                })
-                        except json.JSONDecodeError:
-                            continue
-
-            mark_as_run("feroxbuster", target)
-
+                
         if all_findings:
             update_db("interesting_files", all_findings)
             return (
