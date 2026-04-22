@@ -1,20 +1,31 @@
 """
 tools.py — LangChain tools for HackSmarter Swarm.
 
-Key fixes applied
------------------
+Security fixes applied
+----------------------
 1. _clean_env()          – strips ALL secrets from every subprocess environment.
 2. _assert_in_scope()    – hard scope enforcement before any network call.
 3. Nuclei parsing        – always JSONL (one object per line), never json.load().
 4. Feroxbuster filter    – only HTTP 200/204 treated as "interesting files".
 5. WPScan output         – written to a JSON file; no silent truncation.
 6. Logging               – Python logging throughout; no bare print().
+7. Scope initialisation  – fails CLOSED (RuntimeError) when set_allowed_scope()
+                           has never been called; empty scope set is explicit opt-in.
+8. Scope suffix check    – rejects bare public suffixes; adds IP/CIDR support.
+9. WPScan API token      – passed via subprocess env, never in argv / ps output.
+10. SSL verification     – explicit ssl.create_default_context() for urlopen.
+11. Credential storage   – plaintext passwords hashed (SHA-256) before DB insert;
+                           raw value used only for Hydra verification then discarded.
+12. subfinder timeout    – hard 300-second timeout prevents indefinite hangs.
 """
 
+import hashlib
+import ipaddress
 import json
 import logging
 import os
 import re
+import ssl
 import subprocess
 import threading
 from typing import List, Union
@@ -38,6 +49,15 @@ FEROX_LOCK = threading.Lock()
 
 # Authorised target set — populated by hacksmarter.py before scanning starts.
 _ALLOWED_SCOPE: set = set()
+# Sentinel: distinguishes "never initialised" (unsafe) from "explicitly empty" (all allowed).
+_SCOPE_INITIALISED: bool = False
+
+# Minimal list of public suffixes to reject as bare scope entries.
+# Prevents accidental "scope = co.uk" matching every .co.uk domain.
+_BARE_PUBLIC_SUFFIXES = frozenset({
+    "com", "net", "org", "io", "gov", "edu", "mil",
+    "co.uk", "org.uk", "me.uk", "com.au", "net.au",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -46,25 +66,60 @@ _ALLOWED_SCOPE: set = set()
 
 def set_allowed_scope(targets: list):
     """Register authorised targets. Must be called before any scan begins."""
-    global _ALLOWED_SCOPE
+    global _ALLOWED_SCOPE, _SCOPE_INITIALISED
+    for t in targets:
+        bare = re.sub(r"^https?://", "", t).split(":")[0].split("/")[0].lower()
+        if bare in _BARE_PUBLIC_SUFFIXES:
+            raise ValueError(
+                f"Refusing to register bare public suffix '{bare}' as a scope entry. "
+                "Use a fully-qualified domain (e.g. 'example.com')."
+            )
     _ALLOWED_SCOPE = set(targets)
+    _SCOPE_INITIALISED = True
     logger.info("Scope locked to: %s", _ALLOWED_SCOPE)
 
 
 def _assert_in_scope(target: str):
     """
     Raise ValueError when *target* is outside the allowed scope.
-    Strips protocol/port, then checks suffix match so sub-domains of an
-    in-scope root domain are also permitted.
-    No-op if the scope set is empty (graceful during startup / tests).
+
+    Behaviour:
+    - If set_allowed_scope() has never been called → RuntimeError (fails closed).
+    - If scope is explicitly empty (set_allowed_scope([])) → allow all (opt-in).
+    - Strips protocol/port before comparing.
+    - Supports exact domain match and subdomain suffix match.
+    - Supports IPv4 CIDR ranges: if any allowed entry is a CIDR network,
+      checks whether the target IP falls within it.
     """
+    if not _SCOPE_INITIALISED:
+        raise RuntimeError(
+            "Scope has not been initialised. Call set_allowed_scope() before scanning."
+        )
     if not _ALLOWED_SCOPE:
-        return
-    bare = re.sub(r"^https?://", "", target).split(":")[0].split("/")[0]
+        return  # Explicitly empty scope = unrestricted (intentional opt-in)
+
+    bare = re.sub(r"^https?://", "", target).split(":")[0].split("/")[0].lower()
+
     for allowed in _ALLOWED_SCOPE:
-        allowed_bare = re.sub(r"^https?://", "", allowed).split(":")[0].split("/")[0]
-        if bare == allowed_bare or bare.endswith("." + allowed_bare):
+        allowed_bare = re.sub(r"^https?://", "", allowed).split(":")[0].split("/")[0].lower()
+
+        # 1. Exact match
+        if bare == allowed_bare:
             return
+
+        # 2. Subdomain suffix match (e.g. sub.example.com vs example.com)
+        if bare.endswith("." + allowed_bare):
+            return
+
+        # 3. CIDR range match for IP targets
+        try:
+            network = ipaddress.ip_network(allowed_bare, strict=False)
+            target_ip = ipaddress.ip_address(bare)
+            if target_ip in network:
+                return
+        except ValueError:
+            pass  # Not a valid CIDR or IP — skip this check
+
     raise ValueError(
         f"OUT-OF-SCOPE target blocked: '{target}'. Allowed: {_ALLOWED_SCOPE}"
     )
@@ -97,6 +152,18 @@ def _clean_env() -> dict:
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
+
+def _hash_password(plaintext: str) -> str:
+    """
+    Return a SHA-256 hex digest of *plaintext*.
+    Used to avoid storing raw breach passwords in the database.
+    The original value is retained only transiently in memory for
+    Hydra verification and then discarded.
+    """
+    if not plaintext:
+        return ""
+    return hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
+
 
 def init_db():
     """Initialise SQLite schema."""
@@ -177,7 +244,8 @@ def update_db(key: str, new_data: list):
                         item.get("domain", ""),
                         item.get("email", ""),
                         item.get("username", ""),
-                        item.get("password", ""),
+                        # Store only the SHA-256 digest — never raw plaintext.
+                        _hash_password(item.get("password", "")),
                         item.get("hashed_password", ""),
                         item.get("source", ""),
                     ),
@@ -320,12 +388,17 @@ def run_subfinder_tool(domain: str) -> str:
             ["subfinder", "-d", domain, "-silent"],
             capture_output=True,
             text=True,
+            timeout=300,  # prevent indefinite hang on large/misconfigured targets
             env=_clean_env(),
         )
         if SKIP_CURRENT_TASK:
             SKIP_CURRENT_TASK = False
             mark_as_run("subfinder", domain)
             return f"Subfinder for {domain} skipped by user."
+    except subprocess.TimeoutExpired:
+        logger.warning("subfinder timed out after 300 s for %s.", domain)
+        mark_as_run("subfinder", domain)
+        return f"Subfinder timed out for {domain}."
     except KeyboardInterrupt:
         SKIP_CURRENT_TASK = False
         mark_as_run("subfinder", domain)
@@ -671,19 +744,23 @@ def run_wpscan_tool(target_url: str) -> str:
 
     out_file = os.path.join(OUTPUT_DIR, "wpscan_out.json")
     wpscan_token = os.environ.get("WPSCAN_API_TOKEN")
-    token_args = ["--api-token", wpscan_token] if wpscan_token else []
 
-    cmd = (
-        ["wpscan", "--url", target_url, "--no-update",
-         "--random-user-agent", "-e", "vp,vt",
-         "--format", "json", "-o", out_file]
-        + token_args
-    )
+    # FIX: pass the token through the subprocess environment, NOT via --api-token
+    # in argv. Argv is visible to all local users via `ps aux` / /proc/<pid>/cmdline.
+    wpscan_env = _clean_env()
+    if wpscan_token:
+        wpscan_env["WPSCAN_API_TOKEN"] = wpscan_token
+
+    cmd = [
+        "wpscan", "--url", target_url, "--no-update",
+        "--random-user-agent", "-e", "vp,vt",
+        "--format", "json", "-o", out_file,
+    ]
 
     logger.info("Running wpscan on %s…", target_url)
     try:
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, env=_clean_env())
+            result = subprocess.run(cmd, capture_output=True, text=True, env=wpscan_env)
         except KeyboardInterrupt:
             mark_as_run("wpscan", target_url)
             return "WPScan interrupted by user."
@@ -693,7 +770,7 @@ def run_wpscan_tool(target_url: str) -> str:
             logger.warning("WPScan DB missing — updating…")
             subprocess.run(["wpscan", "--update"], capture_output=True, text=True)
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, env=_clean_env())
+                result = subprocess.run(cmd, capture_output=True, text=True, env=wpscan_env)
             except KeyboardInterrupt:
                 mark_as_run("wpscan", target_url)
                 return "WPScan interrupted by user."
@@ -895,7 +972,8 @@ def run_dehashed_tool(domain: str) -> str:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
+        _ssl_ctx = ssl.create_default_context()  # enforces cert verification
+        with urllib.request.urlopen(req, timeout=30, context=_ssl_ctx) as resp:
             raw = resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         mark_as_run("dehashed", domain)
